@@ -100,14 +100,12 @@ def fetch_adzuna(
     )
 
     params = {
-        "app_id":          ADZUNA_APP_ID,
-        "app_key":         ADZUNA_APP_KEY,
-        "what":            role,
-        "where":           "India",
+        "app_id":           ADZUNA_APP_ID,
+        "app_key":          ADZUNA_APP_KEY,
+        "what":             role,
+        "where":            "India",
         "results_per_page": results,
-        # "content-type":    "application/json",
-        "sort_by":         "date",           # freshest jobs first
-        "full_description": 1,               # get full JD text for RAG
+        "sort_by":          "date", 
     }
 
     try:

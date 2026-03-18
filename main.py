@@ -1,12 +1,18 @@
 """
 main.py — Entry point for the job search pipeline.
 
-Run this file to execute the full pipeline.
-During development, each step is gated so you can test incrementally.
+Steps:
+  Step 2: Fetch jobs from Adzuna + Serpapi   (--fetch-only)
+  Step 3: Score jobs via RAG + Mistral       (--score-only)
+  Step 2+3: Fetch then score                (--fetch-and-score)
+  Full pipeline (Steps 2-5):                (no flag)
 
 Usage:
-    python main.py              # runs full pipeline
-    python main.py --fetch-only # runs Step 2 only (job fetching)
+    python main.py --fetch-only        # Step 2: fetch raw jobs
+    python main.py --score-only        # Step 3: score from cached raw_jobs.json
+    python main.py --fetch-and-score   # Steps 2+3: fetch fresh + score
+    python main.py --no-llm            # Skip Ollama summaries (faster testing)
+    python main.py                     # Full pipeline (Steps 2-5)
 """
 
 import argparse
@@ -17,63 +23,114 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-def run_fetch_only():
-    """Step 2: Fetch jobs from Adzuna + Serpapi and print a summary."""
+def run_fetch_only() -> list[dict]:
+    """Step 2: Fetch jobs from Adzuna + Serpapi."""
     from src.fetch_jobs import fetch_all_jobs
     from src.config import TARGET_ROLES
+    from collections import Counter
 
     print("\n" + "=" * 60)
-    print("  STEP 2 — Job API Integration Test")
+    print("  STEP 2 - Job API Fetch")
     print("=" * 60 + "\n")
 
     jobs = fetch_all_jobs(roles=TARGET_ROLES)
 
-    # Save raw results to outputs/ for inspection
     output_path = Path("outputs") / "raw_jobs.json"
     output_path.parent.mkdir(exist_ok=True)
-
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(jobs, f, indent=2, ensure_ascii=False)
 
     print(f"\n{'=' * 60}")
-    print(f"  Results Summary")
+    print(f"  Fetch Summary")
     print(f"{'=' * 60}")
-    print(f"  Total unique jobs fetched : {len(jobs)}")
-
-    # Breakdown by source
-    adzuna_count  = sum(1 for j in jobs if j["source"] == "adzuna")
-    serpapi_count = sum(1 for j in jobs if j["source"] == "serpapi")
-    print(f"  From Adzuna               : {adzuna_count}")
-    print(f"  From Serpapi              : {serpapi_count}")
-
-    # Breakdown by role (top 5)
-    from collections import Counter
-    role_counts = Counter(j["title"] for j in jobs)
+    print(f"  Total unique jobs  : {len(jobs)}")
+    print(f"  From Adzuna        : {sum(1 for j in jobs if j['source'] == 'adzuna')}")
+    print(f"  From Serpapi       : {sum(1 for j in jobs if j['source'] == 'serpapi')}")
     print(f"\n  Top roles found:")
-    for role, count in role_counts.most_common(5):
+    for role, count in Counter(j["title"] for j in jobs).most_common(5):
         print(f"    {role:<40} {count} jobs")
-
-    print(f"\n  Raw output saved to: {output_path}")
-    print(f"\n  Sample job:")
-    if jobs:
-        sample = jobs[0]
-        print(f"    Title:   {sample['title']}")
-        print(f"    Company: {sample['company']}")
-        print(f"    Loc:     {sample['location']}")
-        print(f"    Source:  {sample['source']}")
-        print(f"    Desc:    {sample['description'][:120]}...")
-
+    print(f"\n  Saved to: {output_path}")
     return jobs
 
 
-def run_full_pipeline():
-    """Runs all steps in sequence. Expands as we build each step."""
-    jobs = run_fetch_only()
-    # Step 3 (RAG scoring) will be called here next
-    # Step 4 (GitHub Actions) is config, not runtime
-    # Step 5 (CSV output) will be called here after scoring
-    print("\n[Step 3, 4, 5 coming soon — run step by step for now]")
-    return jobs
+def run_score_only(use_llm: bool = True) -> list:
+    """Step 3: Load cached raw jobs, score them, save scored output."""
+    import os
+    from src.resume_loader import load_resume
+    from src.score_jobs import score_jobs
+    from src.config import MIN_FIT_SCORE
+
+    print("\n" + "=" * 60)
+    print("  STEP 3 - RAG Scoring Engine")
+    print("=" * 60 + "\n")
+
+    # Load resume
+    resume_path = os.getenv("RESUME_PATH", "data/resume.pdf")
+    print(f"Loading resume from: {resume_path}")
+    try:
+        resume = load_resume(resume_path)
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}")
+        raise SystemExit(1)
+
+    print(f"  Skills detected : {', '.join(resume.skills[:10])}")
+    print(f"  Word count      : {resume.word_count()}\n")
+
+    # Load raw jobs from Step 2
+    raw_path = Path("outputs") / "raw_jobs.json"
+    if not raw_path.exists():
+        print(f"ERROR: {raw_path} not found.")
+        print("Run Step 2 first:  python main.py --fetch-only")
+        raise SystemExit(1)
+
+    with open(raw_path, encoding="utf-8") as f:
+        jobs = json.load(f)
+    print(f"Loaded {len(jobs)} jobs from {raw_path}\n")
+
+    # Score all jobs
+    scored = score_jobs(jobs, resume, use_llm=use_llm)
+
+    # Save full scored output as JSON
+    scored_path = Path("outputs") / "scored_jobs.json"
+    with open(scored_path, "w", encoding="utf-8") as f:
+        json.dump([j.to_dict() for j in scored], f, indent=2, ensure_ascii=False)
+
+    # Print summary
+    shortlist = [j for j in scored if j.fit_score >= MIN_FIT_SCORE]
+
+    print(f"\n{'=' * 60}")
+    print(f"  Scoring Summary")
+    print(f"{'=' * 60}")
+    print(f"  Total scored        : {len(scored)}")
+    print(f"  Above threshold     : {len(shortlist)} (fit >= {MIN_FIT_SCORE})")
+    if scored:
+        avg = sum(j.fit_score for j in scored) / len(scored)
+        print(f"  Average fit score   : {avg:.3f}")
+
+    print(f"\n  Top 10 Matches:")
+    print(f"  {'Score':<8} {'Label':<12} {'Title':<35} Company")
+    print(f"  {'-'*8} {'-'*12} {'-'*35} {'-'*20}")
+    for job in scored[:10]:
+        print(f"  {job.fit_score:.3f}    {job.fit_label():<12} {job.title[:34]:<35} {job.company[:20]}")
+
+    print(f"\n  Full results saved to: {scored_path}")
+    print(f"  (Step 5 will convert this to a clean daily CSV shortlist)")
+
+    return scored
+
+
+def run_fetch_and_score(use_llm: bool = True) -> list:
+    """Steps 2 + 3: Fresh fetch then immediate scoring."""
+    run_fetch_only()
+    return run_score_only(use_llm=use_llm)
+
+
+def run_full_pipeline(use_llm: bool = True):
+    """All steps in sequence. Expands as Steps 4 and 5 are built."""
+    scored = run_fetch_and_score(use_llm=use_llm)
+    print("\n[Step 4: GitHub Actions automation - configured next]")
+    print("[Step 5: CSV shortlist output - coming after Step 4]")
+    return scored
 
 
 if __name__ == "__main__":
@@ -84,56 +141,19 @@ if __name__ == "__main__":
     )
 
     parser = argparse.ArgumentParser(description="Job Search Pipeline")
-    parser.add_argument(
-        "--fetch-only",
-        action="store_true",
-        help="Run Step 2 only: fetch jobs and save raw JSON",
-    )
+    parser.add_argument("--fetch-only",      action="store_true", help="Step 2 only: fetch jobs")
+    parser.add_argument("--score-only",      action="store_true", help="Step 3 only: score cached jobs")
+    parser.add_argument("--fetch-and-score", action="store_true", help="Steps 2+3: fetch then score")
+    parser.add_argument("--no-llm",          action="store_true", help="Skip Ollama LLM summaries (faster)")
     args = parser.parse_args()
+
+    use_llm = not args.no_llm
 
     if args.fetch_only:
         run_fetch_only()
+    elif args.score_only:
+        run_score_only(use_llm=use_llm)
+    elif args.fetch_and_score:
+        run_fetch_and_score(use_llm=use_llm)
     else:
-        run_full_pipeline()
-        
-# ── Enhanced Standalone Test ───────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import json
-    
-    print("\n=== Starting Job Fetcher Test ===")
-    
-    # We use just one role for testing to avoid burning through your free SerpApi quota
-    test_roles = ["Data Scientist"]
-    
-    try:
-        # Run the fetcher
-        test_jobs = fetch_all_jobs(roles=test_roles, delay_seconds=1.0)
-        
-        print(f"\n{'='*60}")
-        print(f"Test complete! Successfully processed {len(test_jobs)} valid jobs.")
-        print(f"{'='*60}")
-
-        if test_jobs:
-            print("\nPreview of the first job:")
-            first_job = test_jobs[0]
-            for key, value in first_job.items():
-                # Truncate the description so it doesn't flood your console
-                if key == "description" and value:
-                    print(f"  {key.ljust(12)}: {value[:100]}... [Truncated]")
-                else:
-                    print(f"  {key.ljust(12)}: {value}")
-            
-            # Save the raw list of dicts to a JSON file for easy inspection
-            output_file = "test_jobs_output.json"
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(test_jobs, f, indent=2, ensure_ascii=False)
-                
-            print(f"\n[✔] Full scraped results saved to '{output_file}'")
-            print("    Open this file to verify the descriptions look good for your RAG prompt!")
-            
-        else:
-            print("\n[!] No jobs returned. Double-check your .env file to ensure API keys are loaded.")
-
-    except Exception as e:
-        print(f"\n[ERROR] The test crashed: {e}")
+        run_full_pipeline(use_llm=use_llm)
